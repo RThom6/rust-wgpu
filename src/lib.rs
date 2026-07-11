@@ -1,10 +1,9 @@
 use std::sync::Arc;
 
-use wgpu::wgc::resource::TextureErrorDimension::X;
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalPosition,
-    event::{DeviceEvent::MouseMotion, KeyEvent, WindowEvent},
+    event::{KeyEvent, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
     window::Window,
@@ -29,6 +28,7 @@ pub struct State {
     is_surface_configured: bool,
     clear_color: wgpu::Color,
     window: Arc<Window>,
+    render_pipeline: wgpu::RenderPipeline,
 }
 
 impl State {
@@ -45,23 +45,30 @@ impl State {
 
         let surface = instance.create_surface(window.clone()).unwrap();
 
+        // Could optionally define it like this, enumerating all available adapters and trying to find a compatible one
+        // wasm doesnt have enumerate so would have to use request if doing web assembly
+        // let adapter = instance
+        //     .enumerate_adapters(wgpu::Backends::all())
+        //     .await
+        //     .into_iter()
+        //     .filter(|adapter| adapter.is_surface_supported(&surface))
+        //     .next()
+        //     .unwrap();
+
         let adapter = instance
-            .enumerate_adapters(wgpu::Backends::all())
-            .await
-            .into_iter()
-            .filter(|adapter| {
-                // check if adapter supports our surface
-                adapter.is_surface_supported(&surface)
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::default(),
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
             })
-            .next()
-            .unwrap();
+            .await?;
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: None,
                 required_features: wgpu::Features::empty(),
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                required_limits: wgpu::Limits::default(),
+                required_limits: wgpu::Limits::default(), // if webgl we'd disable some with downlevel_webgl2_defaults instead of default()
                 memory_hints: Default::default(),
                 trace: wgpu::Trace::Off,
             })
@@ -77,8 +84,8 @@ impl State {
             .unwrap_or(surface_caps.formats[0]);
 
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: surface_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT, //specifies the textures will be used to write to the screen
+            format: surface_format, // how the textures are stored in the gpu, obtained from the surface capabilities
             width: size.width,
             height: size.height,
             present_mode: surface_caps.present_modes[0],
@@ -86,6 +93,56 @@ impl State {
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()), // or wgpu::include_wgsl!("shader.wgsl") as a macro
+        });
+
+        let render_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Render Pipeline Layout"),
+                bind_group_layouts: &[],
+                immediate_size: 0,
+            });
+
+        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Render Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                polygon_mode: wgpu::PolygonMode::Fill, // any other setting needs non fill pollygon feature
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview_mask: None,
+            cache: None,
+        });
 
         Ok(Self {
             surface,
@@ -95,13 +152,16 @@ impl State {
             is_surface_configured: false,
             clear_color: wgpu::Color::BLACK,
             window,
+            render_pipeline,
         })
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
         if width > 0 && height > 0 {
-            self.config.width = width;
-            self.config.height = height;
+            let max_h = 1920;
+            let max_w = max_h * (16 / 9);
+            self.config.width = width.min(max_w);
+            self.config.height = height.min(max_h);
             self.surface.configure(&self.device, &self.config);
             self.is_surface_configured = true;
         }
@@ -139,13 +199,14 @@ impl State {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        // encoder to create commands sent to the gpu
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Render Encoder"),
             });
 
-        let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Render Pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &view,
@@ -161,6 +222,9 @@ impl State {
             timestamp_writes: None,
             multiview_mask: None,
         });
+
+        render_pass.set_pipeline(&self.render_pipeline);
+        render_pass.draw(0..3, 0..1);
 
         drop(render_pass);
 
